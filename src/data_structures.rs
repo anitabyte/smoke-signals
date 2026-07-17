@@ -63,7 +63,6 @@ pub struct CAImages {
     pub back: bool,
     pub comment: String,
     pub front: bool,
-    pub id: usize,
     pub image: String,
 }
 
