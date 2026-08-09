@@ -66,7 +66,7 @@ pub struct CAImages {
     pub image: String,
 }
 
-#[derive(Serialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Debug, Clone, PartialEq, Default)]
 pub struct AlbumData {
     pub artist: String,
     pub release: String,

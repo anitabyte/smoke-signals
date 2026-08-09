@@ -1,8 +1,7 @@
-mod data_structures;
-use data_structures::*;
 use image::ImageReader;
 use lru::LruCache;
-use serde::{Deserialize, Serialize};
+use smoke_signals::data_structures::*;
+use smoke_signals::{BASE_FS_CACHE_PATH, CACHE_ENTRY_SEPARATOR, LB_TOKEN, get_cache_key};
 use std::{
     env,
     fs::read_dir,
@@ -54,10 +53,6 @@ enum ServerError {
     #[error("Serialisation error")]
     SerialisationError(#[from] serde_json::Error),
 }
-
-const LB_TOKEN: &str = "LB_TOKEN";
-const BASE_FS_CACHE_PATH: &str = "cache";
-const CACHE_ENTRY_SEPARATOR: &str = "|-|-|";
 
 #[tracing::instrument(skip(client))]
 async fn get_now_listening(
@@ -137,16 +132,6 @@ async fn resize_image(bytes: Arc<Vec<u8>>) -> Result<Vec<u8>, FetchError> {
     .await?
 }
 
-async fn get_cache_key(metadata: &impl MetadataProvider) -> String {
-    // We only really care about 'releases' from the point of view of album art - no need for get_recording_name
-    hex::encode(format!(
-        "{}{}{}",
-        metadata.get_artist_name(),
-        CACHE_ENTRY_SEPARATOR,
-        metadata.get_release_name(),
-    ))
-}
-
 fn get_file_cache_paths(path: impl AsRef<Path>) -> Vec<PathBuf> {
     let Ok(entries) = read_dir(path) else {
         return vec![];
@@ -207,6 +192,40 @@ async fn populate_cache_from_fs(
     Ok(true)
 }
 
+async fn retrieve_from_cache(
+    track_metadata: &TrackMetadata,
+    inmem_cache: &mut LruCache<String, AlbumData>,
+    cache_key: &str,
+) -> Option<AlbumData> {
+    // first we check the LruCache
+    if let Some(ad) = inmem_cache.get(cache_key) {
+        info!(
+            "Album art for {} - {} retrieved from Lru",
+            ad.artist, ad.release
+        );
+        Some(ad.clone())
+    } else {
+        let cache_file_path: PathBuf = [BASE_FS_CACHE_PATH, cache_key].into_iter().collect();
+        if let Ok(file_content) = get_file_content_from_fs(&cache_file_path).await {
+            // we've retrieved the original artwork: let's do our image transform
+            let art = resize_image(file_content.into()).await.ok()?;
+            let fs_ad = AlbumData::new(
+                track_metadata.get_artist_name().to_string(),
+                track_metadata.get_release_name().to_string(),
+                art,
+            );
+            inmem_cache.put(cache_key.to_string(), fs_ad.clone());
+            info!(
+                "Album art for {} - {} retrieved from disk, inserted into Lru",
+                fs_ad.artist, fs_ad.release
+            );
+            Some(fs_ad)
+        } else {
+            None
+        }
+    }
+}
+
 async fn write_to_fs_cache(
     metadata_provider: &impl MetadataProvider,
     original_image_data: Arc<Vec<u8>>,
@@ -225,10 +244,10 @@ async fn get_album_art_pipeline(
     auth_token: &str,
 ) -> Result<AlbumData, FetchError> {
     let now_listening = get_now_listening(client, auth_token).await?;
-    let cache_key = get_cache_key(&now_listening).await;
-    match cache.get(&cache_key) {
+    let cache_key: String = get_cache_key(&now_listening).await;
+    match retrieve_from_cache(&now_listening, cache, &cache_key).await {
         Some(i) => {
-            info!("Found cached entry: {}", cache_key);
+            info!("Found cached entry: {}", i.release);
             Ok(i.clone())
         }
         None => {
@@ -259,7 +278,7 @@ async fn get_album_art_pipeline(
 async fn start_album_art_loop(tx: Sender<AlbumData>, auth_token: String) {
     let client = reqwest::Client::new();
     let mut cache: LruCache<String, AlbumData> = LruCache::new(NonZeroUsize::new(100).unwrap());
-    populate_cache_from_fs(&mut cache).await;
+
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     let mut current_album_data_key: Option<String> = None;
     loop {
