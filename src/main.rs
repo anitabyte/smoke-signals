@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 use thiserror::Error;
+use tokio::time::MissedTickBehavior;
 use tokio::{
     fs::create_dir_all,
     io::AsyncWriteExt,
@@ -280,6 +281,7 @@ async fn start_album_art_loop(tx: Sender<AlbumData>, auth_token: String) {
     let mut cache: LruCache<String, AlbumData> = LruCache::new(NonZeroUsize::new(100).unwrap());
 
     let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut current_album_data_key: Option<String> = None;
     loop {
         interval.tick().await;
