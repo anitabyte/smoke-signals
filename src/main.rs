@@ -121,12 +121,7 @@ async fn resize_image(bytes: Arc<Vec<u8>>) -> Result<Vec<u8>, FetchError> {
         let img = ImageReader::new(Cursor::new(bytes.as_ref()))
             .with_guessed_format()?
             .decode()?;
-        // we have to rotate and flip for the output to come out right on the Matrix - which is Column-Major
-        let resized_image = img
-            .resize_to_fill(64, 64, image::imageops::FilterType::Gaussian)
-            // We have a stand that mandates this orientation: rotate90 became rotate270
-            .rotate270()
-            .flipv();
+        let resized_image = img.resize_to_fill(64, 64, image::imageops::FilterType::Gaussian);
         let rgb_values = resized_image.to_rgb8().into_raw_bgr().clone();
         Ok(rgb_values)
     })
