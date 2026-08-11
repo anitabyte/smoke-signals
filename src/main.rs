@@ -1,10 +1,9 @@
 use image::ImageReader;
 use lru::LruCache;
 use smoke_signals::data_structures::*;
-use smoke_signals::{BASE_FS_CACHE_PATH, CACHE_ENTRY_SEPARATOR, LB_TOKEN, get_cache_key};
+use smoke_signals::{BASE_FS_CACHE_PATH, LB_TOKEN, get_cache_key};
 use std::{
     env,
-    fs::read_dir,
     io::{self, Cursor},
     num::NonZeroUsize,
     path::{Path, PathBuf},
@@ -19,9 +18,9 @@ use tokio::{
     join,
     net::{TcpListener, TcpStream},
     sync::watch::{self, Receiver, Sender},
-    task::spawn_blocking,
 };
 use tracing::{error, info, warn};
+use tracing_subscriber::fmt::format::FmtSpan;
 
 #[derive(Error, Debug)]
 enum FetchError {
@@ -55,7 +54,7 @@ enum ServerError {
     SerialisationError(#[from] serde_json::Error),
 }
 
-#[tracing::instrument(skip(client))]
+#[tracing::instrument(skip(client, auth_token))]
 async fn get_now_listening(
     client: &reqwest::Client,
     auth_token: &str,
@@ -72,7 +71,7 @@ async fn get_now_listening(
     }
 }
 
-#[tracing::instrument(skip(client))]
+#[tracing::instrument(skip(client, auth_token))]
 async fn get_mbid_id(
     client: &reqwest::Client,
     track_metadata: &TrackMetadata,
@@ -128,66 +127,12 @@ async fn resize_image(bytes: Arc<Vec<u8>>) -> Result<Vec<u8>, FetchError> {
     .await?
 }
 
-fn get_file_cache_paths(path: impl AsRef<Path>) -> Vec<PathBuf> {
-    let Ok(entries) = read_dir(path) else {
-        return vec![];
-    };
-    entries
-        .flatten()
-        .flat_map(|entry| {
-            let Ok(meta) = entry.metadata() else {
-                return vec![];
-            };
-            if meta.is_file() {
-                return vec![entry.path()];
-            }
-            vec![]
-        })
-        .collect()
-}
-
 async fn get_file_content_from_fs(path: &PathBuf) -> Result<Vec<u8>, FetchError> {
     let file_content = tokio::fs::read(path).await?;
     Ok(file_content)
 }
 
-async fn get_cache_key_from_path(path: &Path) -> Result<(String, String, String), FetchError> {
-    let cache_key_hex = path
-        .file_name()
-        .unwrap_or_default()
-        .to_str()
-        .unwrap_or_default();
-    let cache_key = String::from_utf8(hex::decode(cache_key_hex)?)?;
-    let split_string: Vec<&str> = cache_key.split(CACHE_ENTRY_SEPARATOR).collect();
-    warn!("{:?}", cache_key);
-    warn!("{:?}", cache_key_hex);
-    let artist = split_string.get(0).unwrap_or(&"").to_string();
-    let release = split_string.get(1).unwrap_or(&"").to_string();
-    Ok((cache_key_hex.to_string(), artist, release))
-}
-
-async fn populate_cache_from_fs(
-    cache: &mut LruCache<String, AlbumData>,
-) -> Result<bool, FetchError> {
-    let paths_handle = spawn_blocking(|| get_file_cache_paths(BASE_FS_CACHE_PATH));
-    let paths = paths_handle.await?;
-    for path in paths {
-        let cache_key = get_cache_key_from_path(&path).await?;
-        info!("Cache key: {}", cache_key.0);
-        info!("Artist: {}", cache_key.1);
-        info!("Release: {}", cache_key.2);
-        let file_content = get_file_content_from_fs(&path).await?;
-        let file_content_resized = resize_image(Arc::new(file_content)).await?;
-        let ad = AlbumData {
-            artist: cache_key.1,
-            release: cache_key.2,
-            art: file_content_resized.into(),
-        };
-        cache.put(cache_key.0, ad);
-    }
-    Ok(true)
-}
-
+#[tracing::instrument(skip(track_metadata, inmem_cache, cache_key))]
 async fn retrieve_from_cache(
     track_metadata: &TrackMetadata,
     inmem_cache: &mut LruCache<String, AlbumData>,
@@ -233,7 +178,7 @@ async fn write_to_fs_cache(
     Ok(())
 }
 
-#[tracing::instrument(skip(client, cache))]
+#[tracing::instrument(skip(client, cache, auth_token))]
 async fn get_album_art_pipeline(
     client: &reqwest::Client,
     cache: &mut LruCache<String, AlbumData>,
@@ -242,10 +187,7 @@ async fn get_album_art_pipeline(
     let now_listening = get_now_listening(client, auth_token).await?;
     let cache_key: String = get_cache_key(&now_listening).await;
     match retrieve_from_cache(&now_listening, cache, &cache_key).await {
-        Some(i) => {
-            info!("Found cached entry: {}", i.release);
-            Ok(i.clone())
-        }
+        Some(i) => Ok(i.clone()),
         None => {
             info!("No cached entry found");
             let mbid = get_mbid_id(client, &now_listening, auth_token).await?;
@@ -270,7 +212,7 @@ async fn get_album_art_pipeline(
     }
 }
 
-#[tracing::instrument(skip(tx))]
+#[tracing::instrument(skip(tx, auth_token))]
 async fn start_album_art_loop(tx: Sender<AlbumData>, auth_token: String) {
     let client = reqwest::Client::new();
     let mut cache: LruCache<String, AlbumData> = LruCache::new(NonZeroUsize::new(100).unwrap());
@@ -364,7 +306,9 @@ async fn connection_loop(
 
 #[tokio::main]
 pub async fn main() {
-    let subscriber = tracing_subscriber::FmtSubscriber::new();
+    let subscriber = tracing_subscriber::FmtSubscriber::builder()
+        .with_span_events(FmtSpan::CLOSE)
+        .finish();
     tracing::subscriber::set_global_default(subscriber).unwrap();
     let cache_path = Path::new(BASE_FS_CACHE_PATH);
 
