@@ -47,11 +47,11 @@ enum FetchError {
 #[derive(Error, Debug)]
 enum ServerError {
     #[error("Receive error")]
-    ReceiveError(#[from] watch::error::RecvError),
+    Receive(#[from] watch::error::RecvError),
     #[error("IO error")]
-    IoError(#[from] std::io::Error),
+    Io(#[from] std::io::Error),
     #[error("Serialisation error")]
-    SerialisationError(#[from] serde_json::Error),
+    Serialisation(#[from] serde_json::Error),
 }
 
 #[tracing::instrument(skip(client, auth_token))]
@@ -97,11 +97,12 @@ async fn get_mbid_id(
 async fn get_album_art_metadata(
     client: &reqwest::Client,
     mbid: &str,
+    cache_key: &str,
 ) -> Result<CoverArtMetadata, FetchError> {
     let uri = format!("https://coverartarchive.org/release/{}", mbid);
     let response = client.get(uri).send().await?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Err(FetchError::AlbumArtNotAvailable(mbid.to_string()));
+        return Err(FetchError::AlbumArtNotAvailable(cache_key.to_string()));
     }
     let response = response.error_for_status()?;
     Ok(response.json::<CoverArtMetadata>().await?)
@@ -182,20 +183,20 @@ async fn write_to_fs_cache(
 async fn get_album_art_pipeline(
     client: &reqwest::Client,
     cache: &mut LruCache<String, AlbumData>,
+    now_listening: &TrackMetadata,
     auth_token: &str,
+    cache_key: &str,
 ) -> Result<AlbumData, FetchError> {
-    let now_listening = get_now_listening(client, auth_token).await?;
-    let cache_key: String = get_cache_key(&now_listening).await;
-    match retrieve_from_cache(&now_listening, cache, &cache_key).await {
+    match retrieve_from_cache(now_listening, cache, cache_key).await {
         Some(i) => Ok(i.clone()),
         None => {
             info!("No cached entry found");
-            let mbid = get_mbid_id(client, &now_listening, auth_token).await?;
-            let album_art_metadata = get_album_art_metadata(client, &mbid).await?;
+            let mbid = get_mbid_id(client, now_listening, auth_token).await?;
+            let album_art_metadata = get_album_art_metadata(client, &mbid, cache_key).await?;
             let album_art_uri = &album_art_metadata
                 .images
                 .first()
-                .ok_or(FetchError::AlbumArtNotAvailable(mbid))?
+                .ok_or(FetchError::AlbumArtNotAvailable(cache_key.to_string()))?
                 .image;
             let album_art_data = get_album_art_data(client, album_art_uri).await?;
             let album_art_arc = Arc::new(album_art_data);
@@ -205,8 +206,8 @@ async fn get_album_art_pipeline(
                 now_listening.get_release_name().to_string(),
                 sixtyfour_data,
             );
-            write_to_fs_cache(&now_listening, album_art_arc.clone()).await?;
-            cache.put(cache_key, ad.clone());
+            write_to_fs_cache(now_listening, album_art_arc.clone()).await?;
+            cache.put(cache_key.to_string(), ad.clone());
             Ok(ad)
         }
     }
@@ -222,32 +223,45 @@ async fn start_album_art_loop(tx: Sender<AlbumData>, auth_token: String) {
     let mut current_album_data_key: Option<String> = None;
     loop {
         interval.tick().await;
-        let album_data = get_album_art_pipeline(&client, &mut cache, &auth_token).await;
-        match album_data {
+        let now_listening = match get_now_listening(&client, &auth_token).await {
+            Ok(nl) => nl,
+            Err(FetchError::NotPlaying) => {
+                warn!("Nothing playing");
+                continue;
+            }
+            Err(e) => {
+                warn!("Error fetching now playing: {:?}", e);
+                continue;
+            }
+        };
+        let cache_key: String = get_cache_key(&now_listening).await;
+        if let Some(ref current_key) = current_album_data_key
+            && current_key == &cache_key
+        {
+            // if we're still playing the same song, skip fetching the album art
+            continue;
+        }
+        match get_album_art_pipeline(&client, &mut cache, &now_listening, &auth_token, &cache_key)
+            .await
+        {
             Ok(ad) => {
                 let new_data_key: String = get_cache_key(&ad).await;
-                match &current_album_data_key {
-                    Some(cad) if cad.eq(&new_data_key) => {
-                        warn!("Not updating current_album_data")
-                    }
-                    _ => {
-                        current_album_data_key = Some(new_data_key);
-                        tx.send(ad).ok();
-                    }
-                }
+                current_album_data_key = Some(new_data_key);
+                tx.send(ad).ok();
             }
             Err(e) => match e {
-                FetchError::NotPlaying => warn!("Nothing playing"),
                 FetchError::ReqwestError(e) => {
                     warn!("Error communicating with ListenBrainz: {}", e)
                 }
                 FetchError::UriParseError(e) => warn!("Error parsing Uri: {}", e),
                 FetchError::AlbumArtNotAvailable(e) => {
-                    warn!("No album art available for release {}", e)
+                    warn!("No album art available for release {}", e);
+                    // if we have an issue getting album art, let's not hammer CAA and LB - let's set the current_album_data_key
+                    current_album_data_key = Some(e)
                 }
                 _ => warn!("{:?}", e),
             },
-        }
+        };
     }
 }
 
@@ -274,7 +288,7 @@ async fn handle_conn(mut socket: TcpStream, mut rx: Receiver<AlbumData>) {
         let connection_result = connection_loop(&mut socket, &mut rx).await;
         match connection_result {
             Ok(()) => {}
-            Err(ServerError::IoError(e)) => {
+            Err(ServerError::Io(e)) => {
                 warn!(
                     "Some IoError occurred: {:?}. Dropping connection to be safe",
                     e
