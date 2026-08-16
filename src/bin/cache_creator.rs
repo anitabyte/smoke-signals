@@ -131,11 +131,16 @@ pub async fn main() {
     let mp3_leaf_folders = get_directory_leaf_list(base_path);
     match mp3_leaf_folders {
         Ok(folders) => {
+            let number_of_folders: usize = folders.len();
             let mut handles = JoinSet::new();
             for folder in folders {
                 handles.spawn(async { get_album_art(folder).await });
             }
-            handles.join_all().await;
+            let returns = handles.join_all().await;
+            let successes = returns
+                .iter()
+                .fold(0, |acc, x| if x.is_some() { acc + 1 } else { acc });
+            println!("Found {} album art for {}", successes, number_of_folders);
         }
         Err(e) => {
             println!("We shouldn't be here: {:?}", e);
